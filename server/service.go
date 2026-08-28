@@ -286,8 +286,18 @@ func NewService(cfg *v1.ServerConfig) (*Service, error) {
 	}
 
 	// Listen for accepting connections from client using websocket protocol.
-	websocketPaths := []string{netpkg.FrpWebsocketPath}
+	websocketPaths := cfg.Transport.WebsocketPaths
+	if len(websocketPaths) == 0 {
+		websocketPaths = []string{netpkg.FrpWebsocketPath}
+	}
+	// The muxer needs to read enough bytes to cover the longest "GET <path>"
+	// prefix so it can decide which listener should handle the connection.
 	maxPrefixLen := len("GET ") + len(netpkg.FrpWebsocketPath)
+	for _, p := range websocketPaths {
+		if l := len("GET ") + len(p); l > maxPrefixLen {
+			maxPrefixLen = l
+		}
+	}
 	websocketLn := svr.muxer.Listen(0, uint32(maxPrefixLen), func(data []byte) bool {
 		return netpkg.IsWebsocketRequest(data, websocketPaths)
 	})
@@ -715,7 +725,11 @@ func (svr *Service) HandleListener(l net.Listener, internal bool, protocol strin
 		// (websocket over TLS) clients can be handled by the websocket listener
 		// instead of being parsed as the frp protocol.
 		if isTLS && svr.websocketListener != nil {
-			wc, isWS := netpkg.TryWebsocket(c, []string{netpkg.FrpWebsocketPath})
+			wsPaths := svr.cfg.Transport.WebsocketPaths
+			if len(wsPaths) == 0 {
+				wsPaths = []string{netpkg.FrpWebsocketPath}
+			}
+			wc, isWS := netpkg.TryWebsocket(c, wsPaths)
 			// TryWebsocket always returns the connection with the peeked bytes
 			// preserved, so it is safe to keep using it for the frp protocol too.
 			c = wc
