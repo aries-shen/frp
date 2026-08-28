@@ -15,7 +15,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -92,7 +91,7 @@ type Service struct {
 	quicListener *quic.Listener
 
 	// Accept connections using websocket
-	websocketListener net.Listener
+	websocketListener *netpkg.WebsocketListener
 
 	// Accept frp tls connections
 	tlsListener net.Listener
@@ -287,11 +286,12 @@ func NewService(cfg *v1.ServerConfig) (*Service, error) {
 	}
 
 	// Listen for accepting connections from client using websocket protocol.
-	websocketPrefix := []byte("GET " + netpkg.FrpWebsocketPath)
-	websocketLn := svr.muxer.Listen(0, uint32(len(websocketPrefix)), func(data []byte) bool {
-		return bytes.Equal(data, websocketPrefix)
+	websocketPaths := []string{netpkg.FrpWebsocketPath}
+	maxPrefixLen := len("GET ") + len(netpkg.FrpWebsocketPath)
+	websocketLn := svr.muxer.Listen(0, uint32(maxPrefixLen), func(data []byte) bool {
+		return netpkg.IsWebsocketRequest(data, websocketPaths)
 	})
-	svr.websocketListener = netpkg.NewWebsocketListener(websocketLn)
+	svr.websocketListener = netpkg.NewWebsocketListener(websocketLn, websocketPaths...)
 
 	// Create http vhost muxer.
 	if cfg.VhostHTTPPort > 0 {
@@ -696,11 +696,12 @@ func (svr *Service) HandleListener(l net.Listener, internal bool) {
 
 		c = netpkg.NewContextConn(xlog.NewContext(ctx, xl), c)
 
+		var isTLS bool
 		if !internal {
 			log.Tracef("start check TLS connection...")
 			originConn := c
 			forceTLS := svr.cfg.Transport.TLS.Force
-			var isTLS, custom bool
+			var custom bool
 			c, isTLS, custom, err = netpkg.CheckAndEnableTLSServerConnWithTimeout(c, svr.tlsConfig, forceTLS, connReadTimeout)
 			if err != nil {
 				log.Warnf("checkAndEnableTLSServerConnWithTimeout error: %v", err)
@@ -708,6 +709,22 @@ func (svr *Service) HandleListener(l net.Listener, internal bool) {
 				continue
 			}
 			log.Tracef("check TLS connection success, isTLS: %v custom: %v internal: %v", isTLS, custom, internal)
+		}
+
+		// After TLS termination, detect websocket upgrade requests so that wss
+		// (websocket over TLS) clients can be handled by the websocket listener
+		// instead of being parsed as the frp protocol.
+		if isTLS && svr.websocketListener != nil {
+			wc, isWS := netpkg.TryWebsocket(c, []string{netpkg.FrpWebsocketPath})
+			// TryWebsocket always returns the connection with the peeked bytes
+			// preserved, so it is safe to keep using it for the frp protocol too.
+			c = wc
+			if isWS {
+				go func() {
+					_ = svr.websocketListener.HandleConn(wc)
+				}()
+				continue
+			}
 		}
 
 		// Start a new goroutine to handle connection.
